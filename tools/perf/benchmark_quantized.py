@@ -3,14 +3,19 @@ import copy
 from packaging import version
 from argparse import ArgumentParser
 import torch
-import torch_migraphx
+#import torch_migraphx
 import torchvision.models as models
 from utils import benchmark_module, print_bm_results
 
 from torch._export import capture_pre_autograd_graph
 import torch._dynamo
 from torch.ao.quantization.quantize_pt2e import prepare_pt2e, convert_pt2e
-from torch_migraphx.dynamo.quantization import MGXQuantizer
+#from torch_migraphx.dynamo.quantization import MGXQuantizer
+#from torch.ao.quantization.quantizer.xnnpack_quantizer import XNNPACKQuantizer, get_symmetric_quantization_config
+from torch.ao.quantization import QConfigMapping
+import torch.ao.quantization.quantize_fx as quantize_fx
+
+
 
 try:
     import transformers
@@ -65,27 +70,54 @@ def benchmark_torchvision_models(model_name, args):
     torch._dynamo.reset()
     model_fp32 = getattr(models, model_name)().eval()
     input_fp32 = torch.randn(bs, 3, 224, 224)
+    
+    qconfig_mapping = QConfigMapping().set_global(torch.ao.quantization.default_dynamic_qconfig)
 
-    model_export = capture_pre_autograd_graph(copy.deepcopy(model_fp32),
-                                              (input_fp32, ))
-    quantizer = MGXQuantizer(asymmetric_activations=args.asymmetric)
-    m = prepare_pt2e(model_export, quantizer)
+    #model_export = capture_pre_autograd_graph(copy.deepcopy(model_fp32),
+    #                                          (input_fp32, ))
+#    quantizer = MGXQuantizer(asymmetric_activations=args.asymmetric)
+    #quantizer = XNNPACKQuantizer().set_global(get_symmetric_quantization_config())
+    #m = prepare_pt2e(model_export, quantizer)
+    m = quantize_fx.prepare_fx(
+        model_fp32,
+        qconfig_mapping,
+        (input_fp32, ),
+        )
+    # first test case - INT8
+    # calibrate
 
+
+
+    print("RUNNING FIRST CASE")
     with torch.no_grad():
         m(input_fp32)
 
-    q_m = stable_convert_pt2e(m)
+    #q_m = stable_convert_pt2e(m)
+    q_m = quantize_fx.convert_fx(m)
+
 
     mgx_mod = torch.compile(q_m,
-                            backend='migraphx',
-                            options={
-                                "fp16": args.fp16,
-                            }).cuda()
+                            backend='inductor',
+                            )
+    mgx_mod(input_fp32)
+
+    time_int8 = benchmark_module(mgx_mod, (input_fp32, ),
+                                 iterations=args.iter)
+
+    '''
+    mgx_mod = torch.compile(q_m,
+                            backend='inductor',
+                            ).cuda()
     mgx_mod(input_fp32.cuda())
 
     time_int8 = benchmark_module(mgx_mod, (input_fp32.cuda(), ),
                                  iterations=args.iter)
+    '''
     del mgx_mod
+
+
+
+    # second case - F32
 
     if args.no_compare:
         print(
@@ -95,29 +127,34 @@ def benchmark_torchvision_models(model_name, args):
 
     torch._dynamo.reset()
     mgx_mod_fp32 = torch.compile(copy.deepcopy(model_fp32),
-                                 backend='migraphx').cuda()
-    mgx_mod_fp32(input_fp32.cuda())
+                                 backend='inductor')
+    mgx_mod_fp32(input_fp32)
 
-    time_fp32 = benchmark_module(mgx_mod_fp32, (input_fp32.cuda(), ),
+    time_fp32 = benchmark_module(mgx_mod_fp32, (input_fp32, ),
                                  iterations=args.iter)
     del mgx_mod_fp32
 
-    torch._dynamo.reset()
-    mgx_mod_fp16 = torch.compile(model_fp32.half(), backend='migraphx').cuda()
-    mgx_mod_fp16(input_fp32.half().cuda())
 
-    time_fp16 = benchmark_module(mgx_mod_fp16, (input_fp32.half().cuda(), ),
+    # third case - f16
+    torch._dynamo.reset()
+    mgx_mod_fp16 = torch.compile(model_fp32.half(), backend='inductor')
+    mgx_mod_fp16(input_fp32.half())
+
+    time_fp16 = benchmark_module(mgx_mod_fp16, (input_fp32.half(), ),
                                  iterations=args.iter)
     del mgx_mod_fp16
 
     print(
         f"Running benchmarks for {model_fp32._get_name()}, BS = {bs}, Asymmetric = {args.asymmetric}, INT8 + FP16 = {args.fp16}"
     )
+
+
     names = ["MGX FP32", "MGX FP16", "MGX INT8"]
     times = [time_fp32, time_fp16, time_int8]
 
-    print_bm_results(names, times, bs, 0)
 
+    print_bm_results(names, times, bs, 0)
+    print("FINISHED")
 
 def benchmark_transformer_models(model_name, model_class, tokenizer_class,
                                  args):
@@ -134,6 +171,7 @@ def benchmark_transformer_models(model_name, model_class, tokenizer_class,
 
     model_export = capture_pre_autograd_graph(copy.deepcopy(model), (inp, ))
 
+    blassf
     quantizer = MGXQuantizer(asymmetric_activations=args.asymmetric)
     m = prepare_pt2e(model_export, quantizer)
     m(inp)
@@ -146,10 +184,8 @@ def benchmark_transformer_models(model_name, model_class, tokenizer_class,
     q_m = move_q_gm_to_device(q_m)
 
     mgx_mod = torch.compile(q_m,
-                            backend='migraphx',
-                            options={
-                                "fp16": args.fp16,
-                            })
+                            backend='inductor',
+                            )
     mgx_mod(inp.cuda())
 
     time_int8 = benchmark_module(mgx_mod, (inp.cuda(), ), iterations=args.iter)
@@ -164,14 +200,16 @@ def benchmark_transformer_models(model_name, model_class, tokenizer_class,
 
     torch._dynamo.reset()
     mgx_mod_fp32 = torch.compile(copy.deepcopy(model),
-                                 backend='migraphx').cuda()
+                                 backend='inductor').cuda()
     mgx_mod_fp32(inp.cuda())
     time_fp32 = benchmark_module(mgx_mod_fp32, (inp.cuda(), ),
                                  iterations=args.iter)
     del mgx_mod_fp32
 
+
+    '''
     torch._dynamo.reset()
-    mgx_mod_fp16 = torch.compile(model.half(), backend='migraphx').cuda()
+    mgx_mod_fp16 = torch.compile(model.half(), backend='inductor').cuda()
     mgx_mod_fp16(inp.cuda())
 
     time_fp16 = benchmark_module(mgx_mod_fp16, (inp.cuda(), ),
@@ -185,7 +223,7 @@ def benchmark_transformer_models(model_name, model_class, tokenizer_class,
     times = [time_fp32, time_fp16, time_int8]
 
     print_bm_results(names, times, bs, 0)
-
+    '''
 
 def is_torchvision_model(model_name):
     if not hasattr(models, model_name):
